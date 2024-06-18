@@ -1,62 +1,51 @@
-# syntax = docker/dockerfile:1
+FROM ruby:3.1.2
 
-# Make sure RUBY_VERSION matches the Ruby version in .ruby-version and Gemfile
-ARG RUBY_VERSION=3.3.2
-FROM registry.docker.com/library/ruby:$RUBY_VERSION-slim as base
+RUN apt-get update -yq \
+  && apt-get upgrade -yq \
+  #ESSENTIALS
+  && apt-get install -y -qq --no-install-recommends build-essential curl git-core vim passwd unzip cron gcc wget netcat \
+  # RAILS PACKAGES NEEDED
+  && apt-get update \
+  && apt-get install -y --no-install-recommends imagemagick postgresql-client \
+  # INSTALL NODE
+  && curl -sL https://deb.nodesource.com/setup_16.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  # INSTALL YARN
+  && npm install -g yarn
 
-# Rails app lives here
-WORKDIR /rails
+# Clean cache and temp files, fix permissions
+RUN apt-get clean -qy \
+  && rm -rf /var/lib/apt/lists/*
 
-# Set production environment
-ENV RAILS_ENV="production" \
-    BUNDLE_DEPLOYMENT="1" \
-    BUNDLE_PATH="/usr/local/bundle" \
-    BUNDLE_WITHOUT="development"
+RUN mkdir /app
+WORKDIR /app
 
+COPY package.json yarn.lock
+RUN yarn install
 
-# Throw-away build stage to reduce size of final image
-FROM base as build
+# install specific version of bundler
+RUN gem install bundler -v 2.2.32
 
-# Install packages needed to build gems
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential git libpq-dev libvips pkg-config
+ENV BUNDLE_GEMFILE=/app/Gemfile \
+  BUNDLE_JOBS=20 \
+  BUNDLE_PATH=/bundle \
+  BUNDLE_BIN=/bundle/bin \
+  GEM_HOME=/bundle
+ENV PATH="${BUNDLE_BIN}:${PATH}"
 
-# Install application gems
 COPY Gemfile Gemfile.lock ./
-RUN bundle install && \
-    rm -rf ~/.bundle/ "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
-    bundle exec bootsnap precompile --gemfile
+RUN bundle install --binstubs --without development test
 
-# Copy application code
 COPY . .
 
-# Precompile bootsnap code for faster boot times
-RUN bundle exec bootsnap precompile app/ lib/
+ENV RAILS_ENV production
+ENV RAILS_SERVE_STATIC_FILES 1
+ENV RAILS_LOG_TO_STDOUT 1
 
-# Precompiling assets for production without requiring secret RAILS_MASTER_KEY
-RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
+RUN SECRET_KEY_BASE=skb DB_ADAPTER=nulldb bundle exec rails assets:precompile
 
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["./entrypoint.sh"]
 
-# Final stage for app image
-FROM base
-
-# Install packages needed for deployment
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y curl libvips postgresql-client && \
-    rm -rf /var/lib/apt/lists /var/cache/apt/archives
-
-# Copy built artifacts: gems, application
-COPY --from=build /usr/local/bundle /usr/local/bundle
-COPY --from=build /rails /rails
-
-# Run and own only the runtime files as a non-root user for security
-RUN useradd rails --create-home --shell /bin/bash && \
-    chown -R rails:rails db log storage tmp
-USER rails:rails
-
-# Entrypoint prepares the database.
-ENTRYPOINT ["/rails/bin/docker-entrypoint"]
-
-# Start the server by default, this can be overwritten at runtime
 EXPOSE 3000
-CMD ["./bin/rails", "server"]
+CMD bundle exec puma -C config/puma.rb
